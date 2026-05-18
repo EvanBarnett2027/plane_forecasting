@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Raw + processed data are large and reproducible from the ingestion script.
+data/raw/
+data/processed/
