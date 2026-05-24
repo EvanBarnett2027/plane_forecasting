@@ -114,13 +114,69 @@ flight records on
 `(flight_date, reporting_airline, flight_number_reporting_airline, origin,
 dest, crs_dep_time)` (exact-duplicate rows are dropped first).
 
+## Historical weather ingestion (IEM ASOS / METAR)
+
+### Data source
+
+Official **Iowa Environmental Mesonet (IEM)** ASOS download service, which
+rehosts the authoritative NWS/FAA ASOS observations for O'Hare:
+
+```
+https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py
+```
+
+Observations are sub-hourly (routine METAR plus SPECI specials). The
+pipeline mirrors the flight one: one raw CSV per month, cached, with
+retry/backoff, then a combine/clean/validate step. Default range is
+2020-01 through the current month (IEM is near-real-time — no publication
+lag, so weather runs all the way to *today*, capping the partial month).
+
+### 1. Ingest raw monthly files
+
+```bash
+python -m src.ingest_weather_ord --start-year 2020 --start-month 1 --station ORD
+```
+
+Writes `data/raw/iem_asos_ord/YYYY_MM.csv`; existing months are skipped
+unless `--force`. Options: `--end-year`, `--end-month`, `--station`,
+`--raw-dir`, `--timeout` (see `--help`).
+
+### 2. Combine + clean
+
+```bash
+python -m src.clean_weather_ord
+```
+
+Keeps the core meteorological columns, parses `valid` as UTC, adds
+`valid_local` in **America/Chicago** (so it aligns with the flight
+dataset's `scheduled_dep_datetime`), coerces numerics, and **regularises
+the sub-hourly reports to a strict hourly series** (one row per UTC hour,
+preferring the report that has a temperature). Validation asserts the
+station, prints obs per year-month, hourly coverage vs. expected, and
+missingness. Output:
+
+```
+data/processed/ord_weather_iem_2020_present.parquet
+```
+
+Force a full refresh the same way as flights:
+
+```bash
+python -m src.ingest_weather_ord --force
+python -m src.clean_weather_ord
+```
+
 ### Layout
 
 ```
-src/ingest_bts_ord.py   # download + per-month raw save (CLI)
-src/clean_bts_ord.py    # combine + clean + label + validate (CLI)
-data/raw/bts_ontime_ord/YYYY_MM.parquet              # raw monthly files
-data/processed/ord_departures_bts_2020_present.parquet  # processed dataset
+src/ingest_bts_ord.py       # flights: download + per-month raw save (CLI)
+src/clean_bts_ord.py        # flights: combine + clean + label + validate (CLI)
+src/ingest_weather_ord.py   # weather: download + per-month raw save (CLI)
+src/clean_weather_ord.py    # weather: combine + clean + hourly + validate (CLI)
+data/raw/bts_ontime_ord/YYYY_MM.parquet                 # raw flight months
+data/raw/iem_asos_ord/YYYY_MM.csv                       # raw weather months
+data/processed/ord_departures_bts_2020_present.parquet  # processed flights
+data/processed/ord_weather_iem_2020_present.parquet     # processed weather
 ```
 
 `data/` is git-ignored — it is large and fully reproducible from the

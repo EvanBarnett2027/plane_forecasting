@@ -30,6 +30,7 @@ import argparse
 import io
 import logging
 import sys
+import time
 import zipfile
 from datetime import date
 from pathlib import Path
@@ -130,7 +131,43 @@ def raw_path(raw_dir: Path, year: int, month: int, fmt: str) -> Path:
     return raw_dir / f"{year:04d}_{month:02d}.{fmt}"
 
 
-def download_month(year: int, month: int, timeout: int) -> pd.DataFrame | None:
+def _fetch_zip_bytes(url: str, timeout: int, retries: int) -> bytes | None:
+    """GET the BTS zip with retry/backoff on transient network errors.
+
+    Returns the raw bytes, or ``None`` if BTS signals the month is not yet
+    published (HTTP 404). The (connect, read) timeout tuple keeps a slow
+    BTS response from hanging forever; large monthly files are streamed.
+    """
+    last_err: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            with requests.get(
+                url,
+                headers=REQUEST_HEADERS,
+                timeout=(15, timeout),
+                stream=True,
+            ) as resp:
+                if resp.status_code == 404:
+                    logger.info("  not published yet (HTTP 404)")
+                    return None
+                resp.raise_for_status()
+                return resp.content
+        except (requests.exceptions.RequestException,) as err:
+            last_err = err
+            if attempt < retries:
+                backoff = min(60, 5 * 2 ** (attempt - 1))
+                logger.warning(
+                    "  attempt %d/%d failed (%s); retrying in %ds",
+                    attempt, retries, type(err).__name__, backoff,
+                )
+                time.sleep(backoff)
+    raise RuntimeError(
+        f"giving up after {retries} attempts: {url}"
+    ) from last_err
+
+
+def download_month(year: int, month: int, timeout: int,
+                   retries: int = 4) -> pd.DataFrame | None:
     """Download one month of nationwide BTS data.
 
     Returns the full month DataFrame, or ``None`` if BTS has not yet
@@ -138,14 +175,10 @@ def download_month(year: int, month: int, timeout: int) -> pd.DataFrame | None:
     """
     url = BTS_URL_TEMPLATE.format(year=year, month=month)
     logger.info("  GET %s", url)
-    resp = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
-
-    if resp.status_code == 404:
-        logger.info("  not published yet (HTTP 404)")
+    content = _fetch_zip_bytes(url, timeout, retries)
+    if content is None:
         return None
-    resp.raise_for_status()
 
-    content = resp.content
     if not content[:2] == b"PK":
         # BTS returns an HTML error page (HTTP 200) for months not yet released.
         logger.info("  not published yet (non-zip response, %d bytes)", len(content))
@@ -264,6 +297,7 @@ def main(argv=None) -> int:
     )
 
     counts = {"downloaded": 0, "cached": 0, "unavailable": 0}
+    failed: list[str] = []
     months = list(month_iter(args.start_year, args.start_month,
                              args.end_year, args.end_month))
     for year, month in tqdm(months, desc="months", unit="mo"):
@@ -273,8 +307,12 @@ def main(argv=None) -> int:
                 args.fmt, args.force, args.timeout,
             )
         except Exception:
-            logger.exception("%04d-%02d: FAILED", year, month)
-            return 2
+            # One bad month must not abort a multi-year backfill; record it,
+            # keep going, and re-running later resumes from the gap (cached
+            # months are skipped).
+            logger.exception("%04d-%02d: FAILED (continuing)", year, month)
+            failed.append(f"{year:04d}-{month:02d}")
+            continue
         counts[status] += 1
         if status == "unavailable" and args.stop_on_unavailable:
             logger.info("Stopping: %04d-%02d not yet published by BTS.",
@@ -282,9 +320,14 @@ def main(argv=None) -> int:
             break
 
     logger.info(
-        "Done. downloaded=%d cached=%d unavailable=%d",
+        "Done. downloaded=%d cached=%d unavailable=%d failed=%d",
         counts["downloaded"], counts["cached"], counts["unavailable"],
+        len(failed),
     )
+    if failed:
+        logger.error("Failed months (re-run the same command to retry): %s",
+                      ", ".join(failed))
+        return 2
     logger.info("Next: python -m src.clean_bts_ord  (combine + clean)")
     return 0
 
