@@ -1,7 +1,12 @@
 .venv/
+.claude
+.pytest_cache
 __pycache__/
 *.pyc
 
 # Raw + processed data are large and reproducible from the ingestion script.
 data/raw/
 data/processed/
+
+# Model artifacts are reproducible from training_pipeline.py
+artifacts/
