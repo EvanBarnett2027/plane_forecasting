@@ -10,3 +10,11 @@ data/processed/
 
 # Model artifacts are reproducible from training_pipeline.py
 artifacts/
+
+# Secrets / API keys -- never commit
+aeroapi.key
+*.key
+.env
+.env.*
+.streamlit/secrets.toml
+data/live/

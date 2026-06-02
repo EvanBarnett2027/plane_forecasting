@@ -515,6 +515,221 @@ post-hoc isotonic recalibrator can finish cleaning up.
   where calibration + a `trailing_disruption_rate` operational feature
   would help most.
 
+## Real-time serving: live data collection
+
+The training pipeline is a backtest over BTS history. To drive a live
+dashboard (refresh every 15 min on EC2) the same feature frame must be
+rebuilt from **real-time** sources. Three collectors do this; their
+output composes into the exact schema `prepare_features` +
+`join_flights_weather` expect, so the serve path reuses the training
+transforms (no train/serve skew by construction).
+
+| module | job | provider |
+|---|---|---|
+| [src/live_flights.py](src/live_flights.py) | next-48 h ORD departure schedule **and** recent completed flights | AeroDataBox via API.Market (swappable) |
+| [src/live_weather.py](src/live_weather.py) | hourly weather forecast per airport, mapped to the model wx schema | NWS `api.weather.gov` (free, US) |
+| [src/trailing_state.py](src/trailing_state.py) | as-of-now `trailing_disruption_rate_*` + `days_since_2021` | derived from recent completed flights |
+
+```bash
+# 1. forward schedule for the next 48 h (needs an AeroDataBox key)
+AERODATABOX_KEY=... python -m src.live_flights schedule
+# 2. recent completed flights (last 168 h) for the trailing rate
+AERODATABOX_KEY=... python -m src.live_flights recent --lookback-h 168
+# Optional: seed the dashboard's rolling trailing-rate cache in one shot
+AERODATABOX_KEY=... python -m src.live_flights backfill-cache --lookback-h 168
+# Same seed, explicitly paced under the gateway's ~1 request/second limit
+python -m src.backfill_recent_cache --lookback-h 168 --chunk-h 12 --sleep-s 1.5
+# 3. weather forecasts for ORD + every destination in the schedule
+python -m src.live_weather --flights data/live/flights_next48h.parquet
+```
+
+**Why AeroDataBox over FlightAware AeroAPI.** AeroAPI returns airport
+results in 15-record result sets, and a Personal-tier key is capped at ~10
+result sets/minute. ORD has ~1,200+ departures in a 48 h window (80+ result
+sets), so just fetching the forward schedule could take minutes — and the
+recent-history pull made it worse. AeroDataBox's **FIDS "airport
+departures/arrivals by local time range"** endpoint returns *every*
+departure in a window in one request — no 15-record paging. The window is
+capped at **12 h** by the API (verified against the OpenAPI spec), so the
+next-48 h schedule is four chunked calls (~4 s) and a 168 h history is
+`ceil(168/12)=14` chunked calls. It is also cheap: the endpoint is **Tier 2
+(2 API units/request)**, so a full schedule refresh is ~8 units — fractions
+of a cent on API.Market's low-cost plans. Auth is the `x-magicapi-key`
+header against `https://prod.api.market/api/v1/aedbx/aerodatabox`.
+
+**Marketplace (API.Market vs RapidAPI).** AeroDataBox is resold through
+several gateways that proxy the *same* API (identical path, params, Tier 2,
+response). Pick the one your **key** is from with `AERODATABOX_PROVIDER`
+(default `apimarket`; the dashboard also has a "Marketplace" selector under
+the Live source). They differ only in base URL + auth headers:
+
+| provider | base URL | auth header(s) |
+|---|---|---|
+| `apimarket` (default) | `prod.api.market/api/v1/aedbx/aerodatabox` | `x-magicapi-key` |
+| `rapidapi` | `aerodatabox.p.rapidapi.com` | `X-RapidAPI-Key` + `X-RapidAPI-Host` |
+
+```bash
+# example: a RapidAPI key
+AERODATABOX_PROVIDER=rapidapi AERODATABOX_KEY=... python -m src.live_flights schedule
+# or per-invocation: python -m src.live_flights schedule --provider rapidapi
+```
+
+**Two layers of caching keep costs near zero.**
+
+1. *Raw-response TTL cache* (`data/live/cache/aerodatabox/`, env
+   `AERODATABOX_CACHE_TTL_S`, default 600 s) dedupes identical FIDS calls —
+   e.g. the four schedule chunks of one refresh, or repeated CLI runs.
+2. *Rolling normalized parquet cache* — the **Live** dashboard avoids
+   re-pulling the full 168 h recent history on every refresh: it fetches a
+   small recent window (`AERODATABOX_RECENT_CACHE_REFRESH_H`, default 3 h),
+   appends/dedupes it into `data/live/flights_recent_cache.parquet`, and
+   keeps a rolling 168 h cache (`AERODATABOX_RECENT_CACHE_RETENTION_H`).
+   During cold start, any trailing-rate window the cache does not yet cover
+   falls back to the latest local BTS trailing-state snapshot; once the
+   cache has aged in, those windows become genuinely live.
+
+So steady-state cost is ~4 schedule chunks + 1 recent chunk ≈ 5 requests
+(~10 units) per refresh. To make the 168 h trailing rate representative
+immediately, run `backfill-cache` once before starting the dashboard, or use
+`src.backfill_recent_cache` to walk newest-to-oldest in ≤12 h chunks,
+sleeping ~1.5 s between calls to stay under the gateway's ~1 req/s limit.
+
+**Two clocks.** The model is *retrained* slowly (monthly) and serialized
+to S3; the dashboard *refreshes* fast (15 min) by re-running the three
+collectors, joining, scoring, and aggregating to the per-occasion 48 h
+rate. The 15-min loop never retrains.
+
+**The trailing rate does not look forward.** `t_now` is the issue time,
+not the flight's departure. Every flight in the next-48 h batch shares
+one trailing-rate snapshot computed over ORD flights that *already
+completed* in the last `{6,24,72,168} h` (indexed by scheduled arrival,
+strict `< t_now`, so each averaged flight has realised its full label).
+The flight 2 h out and the flight 36 h out get the **same** value — it's
+"how disrupted has ORD been recently", not anything about the future.
+See the [src/trailing_state.py](src/trailing_state.py) module docstring.
+
+**Provider notes / train-serve skew.** The flight adapter is abstracted
+behind a normalized schema (`aerodatabox_to_normalized`); swapping
+AeroDataBox for FlightAware/AviationStack/OAG/Cirium is a one-function change.
+NWS does not forecast every field the ASOS observations carried —
+`vsby`, `mslp`, `alti`, `peak_wind_gust`, `snowdepth` and `n_reports`
+come back NaN (the model handles NaN natively). `n_reports` ranked high
+in importance, so its absence is the biggest skew; consider retraining
+the live model without it. International destinations are outside NWS
+coverage and get NaN weather (use a global provider if needed).
+
+`tests/test_live_collection.py` pins the pure transforms (unit
+conversions, HHMM/UTC derivation, distance, trailing-window boundaries).
+
+## Production model + recent-week deployment test
+
+The dashboard serves a dedicated production artifact, **not** the
+experimental `training_pipeline` model. Two deliberate differences:
+
+- **No `*_wx_n_reports` feature.** `n_reports` is the count of sub-hourly
+  METARs behind each historical weather row — a diagnostic of the
+  *observation* stream with no forecast equivalent (NWS returns NaN for
+  it, see [src/live_weather.py](src/live_weather.py)). Keeping it would
+  train on a feature that is always missing at serve time. The production
+  model drops it from both endpoints.
+- **No isotonic calibrator.** Shipped raw (calibration is a
+  downstream-consumer choice; see
+  [notebooks/lightgbm_investigation.ipynb](notebooks/lightgbm_investigation.ipynb)).
+
+```bash
+# train the production LightGBM on ALL labelled data (val = last 30 days)
+python -m src.train_production_model
+```
+
+Writes a deployable bundle to `artifacts/production_model/`:
+`model.joblib` (model + frozen category vocab + `feature_names`),
+`model.txt` (LightGBM native dump — portable across library versions),
+and `metadata.json` (feature list, vocabularies, **pinned library
+versions**, train window, base rate, validation metrics). Upload the
+folder to S3; the serve loop loads `model.joblib`, selects
+`metadata["feature_names"]`, and predicts.
+
+### Recent-week deployment-realism test
+
+```bash
+python -m src.evaluate_recent_week
+```
+
+Trains on every flight before the most recent labelled week, then scores
+per-occasion 48 h forecasts across that week under **forecast
+conditions** (weather-noise proxy — a true live-forecast-vs-label test is
+impossible offline because retrievable NWS forecasts and BTS ground truth
+never overlap in time; the noise injector is the project's sanctioned
+forecast simulator). It trains two variants to quantify the cost of
+dropping `n_reports`. Latest run (test week **2026-02-22 → 03-01**, 21
+occasions, including the Feb 22–23 disruption spike):
+
+| variant | features | AUC | Brier | per-occasion MAE | bias | Pearson r |
+|---|---:|---:|---:|---:|---:|---:|
+| **production (no `n_reports`)** | 55 | 0.661 | 0.205 | **0.034** | −0.031 | **0.972** |
+| with `n_reports` | 57 | 0.665 | 0.204 | 0.031 | −0.027 | 0.970 |
+
+Dropping `n_reports` costs ≈ **0.005 AUC / 0.004 MAE** — a small,
+acceptable price for eliminating the train/serve skew. The production
+model tracks the week's disruption-rate trajectory tightly (Pearson 0.97,
+MAE 0.034) with a slight regime-drift under-prediction. Artifacts:
+`recent_week_eval.{json,png}` and `recent_week_per_occasion.parquet`.
+
+> A *genuine* live test (real forecasts vs realised labels) requires
+> running a forward snapshot harness: capture today's forecast-driven
+> predictions, then score them a week later against actual outcomes.
+
+## Dashboard (Streamlit)
+
+A web dashboard shows the production model's `P(disrupted)` for every ORD
+departure in the next 48 h, with a refresh button, search bar, and
+filtering. The serving layer [src/serve.py](src/serve.py) ties the three
+collectors + production model into one `predict_next_48h()` call (the
+"prediction API"); [dashboard/app.py](dashboard/app.py) is presentation
+only.
+
+```bash
+# default: genuine next 48 h (no API key needed)
+.venv/bin/streamlit run dashboard/app.py
+
+# live AeroDataBox schedule instead of the projection
+AERODATABOX_KEY=... .venv/bin/streamlit run dashboard/app.py
+```
+
+Three data sources, one scoring core ([src/serve.py](src/serve.py)):
+
+| source | flights | weather | ground truth | key |
+|---|---|---|---|---|
+| **Next 48 h** (default) | ORD's recent schedule **projected onto the real upcoming dates** (real carriers/flight numbers/routes/times, matched by weekday) | **live NWS forecast** | — (future) | no |
+| **Historical replay** | a real labelled 48 h window | already joined | ✓ predicted-vs-actual | no |
+| **Live** | real next-48 h schedule via AeroDataBox | live NWS forecast | — | AeroDataBox |
+
+> Why a *projection* for "Next 48 h": there is no free, no-key source for
+> the future ORD schedule, but ORD's operation is strongly weekly-periodic,
+> so re-stamping the most recent same-weekday schedule onto the upcoming
+> dates is a realistic (not guaranteed) stand-in. The **weather is genuinely
+> live** (NWS forecasts for the real upcoming hours, ~150 airports fetched
+> concurrently in ~10 s). The trailing operational rate uses the most
+> recent *known* airport state, since the as-of-now window post-dates the
+> labelled data. For the literal live schedule, use the Live source.
+
+Features:
+- **Headline metrics** — predicted 48 h disruption rate, flight count,
+  high-risk count; in replay mode also the realised rate (predicted vs
+  actual).
+- **Trajectory + risk mix** — predicted rate by departure hour, and a
+  Low/Moderate/Elevated/High risk histogram.
+- **Refresh button** — re-fetches from the prediction APIs and re-scores
+  (busts the cache); search and filters apply instantly without a
+  refetch.
+- **Search + filter** — free-text search (flight #, airline, dest, city),
+  multiselect airline/dest/risk, and `P(disrupted)` / lead-time sliders;
+  plus a filtered-CSV download.
+
+Two data sources feed one scoring core, so demo and live render
+identically. The script is covered by a headless `AppTest` check (renders
+without error; search/filter/refresh behave).
+
 ### Layout
 
 ```
@@ -526,7 +741,15 @@ src/ingest_dest_weather.py   # orchestrator: weather for every dest + ORD
 src/join_flights_weather.py  # join flights + origin/dest weather (UTC-correct)
 src/weather_noise.py         # train-time noise injection (CLI: fit)
 src/training_pipeline.py     # split + features + noise + fit + occasion eval
+src/live_flights.py          # serve: AeroDataBox next-48h schedule + recent (CLI)
+src/live_weather.py          # serve: NWS hourly forecast -> model wx schema (CLI)
+src/trailing_state.py        # serve: as-of-now trailing disruption rate
+src/train_production_model.py # production LightGBM (no n_reports, no isotonic)
+src/evaluate_recent_week.py  # deployment-realism backtest on the recent week
+src/serve.py                 # prediction API: collectors + model -> per-flight P
+dashboard/app.py             # Streamlit dashboard (refresh, search, filtering)
 tests/test_weather_noise.py  # pytest suite for the noise injector
+tests/test_live_collection.py # pytest suite for the live collectors
 notebooks/disruption_model_eda.ipynb  # EDA + LR vs LightGBM vs HistGBT + calibration
 notebooks/walkforward_eda.ipynb       # walk-forward (expanding window) metric trajectories
 
@@ -540,6 +763,9 @@ data/processed/weather_noise_sigmas.json                      # noise σ table
 artifacts/disruption_model/
   model.joblib, metrics.json, per_occasion.csv     (single-shot)
   walkforward_step_metrics.csv, walkforward_per_{occasion,flight}.parquet
+artifacts/production_model/
+  model.joblib, model.txt, metadata.json           (deployable bundle)
+  recent_week_eval.{json,png}, recent_week_per_occasion.parquet
 ```
 
 `data/` is git-ignored — it is large and fully reproducible from the
