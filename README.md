@@ -23,9 +23,9 @@ pip install -r requirements.txt
 Three helper scripts wrap the full workflow end to end. Run them in order:
 
 ```bash
-./download_data.sh   # 1. download + build the dataset (~30-60 min, network-heavy)
+./download_data.sh   # 1. download + build the dataset (1-3 hrs, network-heavy)
 ./train_model.sh     # 2. train the production model + run the recent-week backtest
-./start_app.sh       # 3. launch the Streamlit dashboard
+./start_app.sh       # 3. launch the Streamlit dashboard (export AEROBOXDATA key first)
 ```
 
 Each script activates nothing globally — it calls the project's `.venv`
@@ -251,6 +251,7 @@ plane_forecasting/
 ├── dashboard/
 │   └── app.py                         # Streamlit dashboard (refresh, search, filter, replay mode)
 ├── notebooks/
+│   ├── flights_eda.ipynb              # Exploratory analysis of the raw BTS flight data
 │   ├── disruption_model_eda.ipynb     # EDA + logistic vs LightGBM vs HistGBT comparison
 │   ├── production_model.ipynb         # Production model analysis and calibration plots
 │   ├── walkforward_eda.ipynb          # Walk-forward metric trajectories over time
