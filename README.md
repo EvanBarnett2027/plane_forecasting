@@ -1,24 +1,14 @@
-# plane_forecasting
-DE300 Final Project — predicting flight disruptions for departures from ORD.
+# Plane Forecasting
 
-## Historical flight-data ingestion (BTS On-Time Performance)
+DE300 Final Project — predicts 48-hour flight disruption probability for ORD departures.
 
-### Data source
+A LightGBM classifier trained on 5 years of BTS flight records and IEM ASOS weather
+observations, served through a Streamlit dashboard that shows per-flight
+`P(disrupted)` for the upcoming 48 h.
 
-Official **BTS / TranStats Airline On-Time Performance Data** (table
-`T_ONTIME_REPORTING`). The pipeline downloads the official pre-zipped
-monthly files BTS publishes for programmatic access:
+---
 
-```
-https://transtats.bts.gov/PREZIP/On_Time_Reporting_Carrier_On_Time_Performance_1987_present_{YEAR}_{MONTH}.zip
-```
-
-The TranStats web download form just builds these same pre-zipped files, so
-this is the official endpoint and needs no form parameters. Each zip holds
-one nationwide CSV per month; the `Origin == ORD` filter is applied
-client-side. No Kaggle or third-party mirror is used.
-
-### Setup
+## Installation
 
 ```bash
 python3 -m venv .venv
@@ -26,747 +16,251 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 1. Ingest raw monthly files
+---
+
+## Quickstart
+
+Three helper scripts wrap the full workflow end to end. Run them in order:
 
 ```bash
-python -m src.ingest_bts_ord --start-year 2020 --start-month 1 --origin ORD
+./download_data.sh   # 1. download + build the dataset (~30-60 min, network-heavy)
+./train_model.sh     # 2. train the production model + run the recent-week backtest
+./start_app.sh       # 3. launch the Streamlit dashboard
 ```
 
-- Loops month-by-month from 2020-01 through the latest available BTS month.
-- Months BTS has not published yet are detected (HTTP 404 / non-zip) and
-  reported as `unavailable`; add `--stop-on-unavailable` to halt at the
-  first gap instead of probing every remaining month.
-- Writes one file per month to `data/raw/bts_ontime_ord/YYYY_MM.parquet`
-  (use `--format csv` for CSV).
-- Existing monthly files are skipped unless `--force` is passed.
+Each script activates nothing globally — it calls the project's `.venv`
+directly, streams per-step logs to `logs/`, and shows a live elapsed-time /
+ETA readout. On any failure it prints the tail of that step's log and stops.
+`download_data.sh` and `train_model.sh` are one-time setup; re-run
+`start_app.sh` whenever you want the dashboard.
 
-Useful options: `--end-year`, `--end-month` (default: current month),
-`--origin`, `--raw-dir`, `--timeout`. See `--help` for all flags.
+The sections below document the individual commands each script runs, in case
+you want to run or customise a single step.
 
-### 2. Combine + clean
+---
+
+## API Keys
+
+| Key | Used for | Required? |
+|---|---|---|
+| `AERODATABOX_KEY` | Live ORD departure schedule via AeroDataBox (API.Market or RapidAPI) | Only for the **Live** dashboard source |
+
+No key is needed for NWS weather forecasts or the default "Next 48 h" projection mode.
+
+Store as an environment variable or place the key (one line, no quotes) in
+`aerodatabox.key` at the project root.
+
+Two marketplace gateways are supported:
 
 ```bash
-python -m src.clean_bts_ord
+# API.Market (default)
+AERODATABOX_KEY=<key> python -m src.live.live_flights schedule
+
+# RapidAPI
+AERODATABOX_PROVIDER=rapidapi AERODATABOX_KEY=<key> python -m src.live.live_flights schedule
 ```
 
-This step:
+---
 
-- concatenates every monthly raw file,
-- standardises all column names to `snake_case`,
-- parses `flight_date` as datetime,
-- builds `scheduled_dep_datetime` / `scheduled_arr_datetime` from
-  `crs_dep_time` / `crs_arr_time` in **America/Chicago** (ORD local time),
-- **preserves cancelled and diverted flights** and does **not** drop rows
-  for missing actual departure/arrival fields (those are blank by
-  definition on cancelled flights),
-- adds the labels below,
-- runs a validation report (see *Validation output*),
+## Data Pipeline
 
-and writes the processed dataset to:
+> **Shortcut:** `./download_data.sh` runs every step in this section in order.
+> The individual commands below are for running or customising a single step.
 
-```
-data/processed/ord_departures_bts_2020_present.parquet
-```
+Run these steps in order once to build the full training dataset.
 
-Rerun anytime; to force a fresh download of months already on disk:
+### 1. Historical flight data (BTS On-Time Performance)
 
 ```bash
-python -m src.ingest_bts_ord --force      # re-download every month
-python -m src.clean_bts_ord               # rebuild the processed parquet
+# Download monthly raw files from BTS TranStats (2020–present)
+python -m src.data.ingest_bts_ord --start-year 2020 --start-month 1
+
+# Combine, clean, add disruption labels, validate
+python -m src.data.clean_bts_ord
+# → data/processed/ord_departures_bts_2020_present.parquet
 ```
 
-### Labels
-
-| Column            | Meaning                                                              |
-|-------------------|----------------------------------------------------------------------|
-| `delayed`         | 1 if `dep_del15 == 1` OR `arr_del15 == 1` (15+ min late dep or arr)   |
-| `disrupted`       | 1 if delayed OR `cancelled == 1` OR `diverted == 1`                   |
-| `canceled`        | = `cancelled` (flight was cancelled)                                  |
-| `diverted_flag`   | = `diverted` (flight was diverted)                                    |
-| `weather_related` | 1 if `weather_delay > 0` OR `cancellation_code == 'B'` (BTS weather)  |
-
-### Feature-leakage guidance
-
-Only **pre-flight** columns are safe as model features. **Post-flight
-outcome** columns are kept for labels/diagnostics but must NOT be used as
-features (they are realised only after the flight operates):
-
-- **Safe features:** date/calendar parts, `reporting_airline`,
-  `tail_number`, `flight_number_reporting_airline`, `origin*`, `dest*`,
-  `crs_dep_time`, `crs_arr_time`, `crs_elapsed_time`, `distance`,
-  `scheduled_dep_datetime`, `scheduled_arr_datetime`.
-- **Post-flight (do NOT use as features):** `dep_time`, `dep_delay*`,
-  `dep_del15`, `taxi_out`, `wheels_off/on`, `taxi_in`, `arr_time`,
-  `arr_delay*`, `arr_del15`, `*_delay_groups`, `cancelled`,
-  `cancellation_code`, `diverted`, `actual_elapsed_time`, `air_time`,
-  `carrier/weather/nas/security/late_aircraft_delay`.
-
-The authoritative lists are `SAFE_FEATURE_COLS` and
-`POST_FLIGHT_OUTCOME_COLS` in [src/clean_bts_ord.py](src/clean_bts_ord.py).
-
-### Validation output
-
-`clean_bts_ord` prints a report that: asserts every row has
-`origin == ORD`, lists row counts per year-month, reports the disruption /
-delay / cancellation / diversion / weather-related rates, summarises
-missingness for important columns, and asserts there are no duplicate
-flight records on
-`(flight_date, reporting_airline, flight_number_reporting_airline, origin,
-dest, crs_dep_time)` (exact-duplicate rows are dropped first).
-
-## Historical weather ingestion (IEM ASOS / METAR)
-
-### Data source
-
-Official **Iowa Environmental Mesonet (IEM)** ASOS download service, which
-rehosts the authoritative NWS/FAA ASOS observations for O'Hare:
-
-```
-https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py
-```
-
-Observations are sub-hourly (routine METAR plus SPECI specials). The
-pipeline mirrors the flight one: one raw CSV per month, cached, with
-retry/backoff, then a combine/clean/validate step. Default range is
-2020-01 through the current month (IEM is near-real-time — no publication
-lag, so weather runs all the way to *today*, capping the partial month).
-
-The scripts are station-agnostic: `--station ORD` (default) for the origin
-pipeline, `--stations A,B,C` or `--all` for many stations at once (used for
-the destination-weather step below).
-
-### 1. Ingest raw monthly files
+### 2. Historical weather data (IEM ASOS / METAR)
 
 ```bash
-python -m src.ingest_iem_asos --start-year 2020 --start-month 1 --station ORD
+# Download hourly METAR observations for ORD
+python -m src.data.ingest_iem_asos --start-year 2020 --start-month 1 --station ORD
+python -m src.data.clean_iem_asos --station ORD
+
+# Download and clean weather for every destination airport
+python -m src.data.ingest_dest_weather --also-clean
+# → data/processed/dest_weather_iem_2020_present.parquet
 ```
 
-Writes `data/raw/iem_asos/{STATION}/YYYY_MM.csv`; existing months are
-skipped unless `--force`. Multi-station mode batches up to `--batch-size`
-stations per IEM request via the API's repeated `station=` parameter. See
-`--help` for `--stations`, `--stations-file`, `--end-year`, `--end-month`,
-`--raw-root`, `--timeout`.
-
-### 2. Combine + clean
+### 3. Join flights with weather
 
 ```bash
-python -m src.clean_iem_asos --station ORD
+python -m src.data.join_flights_weather
+# → data/processed/ord_flights_with_weather_2020_present.parquet
 ```
 
-Keeps the core meteorological columns, parses `valid` as UTC, coerces
-numerics, and **aggregates the sub-hourly METAR/SPECI reports into one
-row per UTC hour with a column-appropriate aggregator** —
-temperature/dewpoint/humidity appear only on the routine METAR (~10% of
-raw rows) while wind, visibility and gust update every ~5 minutes, so a
-single-row pick discards the extremes that matter for disruption
-modelling. Per-column rules (full list in `HOURLY_AGG` in
-[src/clean_iem_asos.py](src/clean_iem_asos.py)):
+`data/` is git-ignored — all files are reproducible from the scripts above.
 
-- **max:** `gust`, `peak_wind_gust`, `p01i`, `ice_accretion_1hr` — the
-  worst-in-hour is the signal.
-- **min:** `vsby`, `skyl1` — worst visibility / lowest ceiling.
-- **mean:** `tmpf`, `dwpf`, `relh`, `feel`, `alti`, `mslp`, `sknt` —
-  stable instant readings.
-- **circular mean** (unit-vector via atan2): `drct` — degrees don't
-  average linearly.
-- **union of distinct tokens:** `wxcodes` — keep every weather code that
-  occurred.
-- **worst sky-cover code** (`VV > OVC > BKN > SCT > FEW > SKC/CLR`):
-  `skyc1`.
-- **first / last:** `station`, `snowdepth`.
+---
 
-An `n_reports` diagnostic column records how many sub-hourly reports fed
-each hourly row (median 13 ≈ 5-min cadence). Validation asserts the
-station, prints hourly coverage vs. expected, and missingness. Output:
+## Model Training
 
-```
-data/processed/weather/{STATION}_iem_2020_present.parquet
-```
+> **Shortcut:** `./train_model.sh` trains the production model and runs the
+> recent-week backtest (it checks the dataset exists first). The commands
+> below cover that plus the experimental pipeline.
 
-Force a full refresh the same way as flights:
+### Fit the weather-noise sigma table (once)
 
 ```bash
-python -m src.ingest_iem_asos --force
-python -m src.clean_iem_asos --station ORD
-```
-
-## Destination-airport weather and the joined dataset
-
-To predict disruption we want weather at both endpoints: ORD at scheduled
-departure, and the destination airport at scheduled arrival. The same IEM
-scripts handle both — destinations are just additional stations.
-
-### 1. Backfill weather for every destination
-
-```bash
-python -m src.ingest_dest_weather --also-clean
-```
-
-This reads the processed flight parquet, extracts every distinct `dest`
-(plus ORD), and calls the multi-station batched IEM ingest for the full
-2020-present range. `--also-clean` then invokes the cleaner over every
-station and produces a combined long table keyed `(station, valid_utc)`:
-
-```
-data/processed/dest_weather_iem_2020_present.parquet
-```
-
-Useful flags: `--top 50` (just the busiest destinations), `--no-origin`
-(skip ORD), `--force`.
-
-### 2. Join flights with origin + destination weather
-
-```bash
-python -m src.join_flights_weather
-```
-
-Builds the final modelling table:
-
-```
-data/processed/ord_flights_with_weather_2020_present.parquet
-```
-
-Every flight row gets:
-- `origin_wx_*` — ORD weather at the **scheduled-departure UTC hour**.
-- `dest_wx_*`   — destination weather at the **scheduled-arrival UTC hour**.
-
-**Timezone-correct join.** `scheduled_arr_datetime` in the flight cleaner
-was built from `crs_arr_time` (destination-local clock) and labelled
-America/Chicago; for non-CT destinations its UTC instant is off by 1–3
-hours. The join instead derives `scheduled_arr_utc` from
-`scheduled_dep_utc + crs_elapsed_time`, which is correct regardless of
-the destination's timezone (no airport→tz lookup required).
-
-## Train-time weather-forecast noise injection
-
-At inference the model will see weather **forecasts**, not observations.
-Training on clean observations and deploying on noisy forecasts is a
-train/test mismatch. [src/weather_noise.py](src/weather_noise.py) adds
-lead-time-aware synthetic noise to the `origin_wx_*` / `dest_wx_*`
-columns during training only, as a step in the training pipeline.
-
-**Methodology.** σ per column is estimated from *persistence residuals*
-in the observed weather:
-
-```
-σ_v(L) = std( v(t) − v(t − L) )   pooled across stations
-```
-
-This is a conservative upper bound on real forecast error (good
-forecasts beat persistence). Per-column noise kinds are chosen to keep
-samples physically valid:
-
-- symmetric numerics → additive Gaussian
-- non-negative (wind, gust) → Gaussian clipped at 0
-- circular (`drct`) → Gaussian then mod 360
-- bounded (`vsby`) → Gaussian clipped to `[0, 10]`
-- zero-inflated (precip-like) → log-normal multiplicative on `>0` values
-- categorical / text / diagnostic → left alone
-
-NaN inputs are preserved (missingness is a signal). Non-weather columns
-are never touched.
-
-**Fit the σ table once:**
-
-```bash
-python -m src.weather_noise fit \
+python -m src.model.weather_noise fit \
     --weather data/processed/dest_weather_iem_2020_present.parquet \
     --out data/processed/weather_noise_sigmas.json
 ```
 
-**Use in a training pipeline:**
-
-```python
-from src.weather_noise import WeatherNoiseInjector
-noise = WeatherNoiseInjector.load(SIGMA_PATH, seed=42).with_scale(1.0)
-X_train = noise.transform(
-    X_train,
-    lead_origin_h=df_train["lead_origin_h"],
-    lead_dest_h=df_train["lead_dest_h"],
-)
-# X_val / X_test left alone, or noise with a fixed seed for deployment-realism eval
-```
-
-Sweep `scale ∈ {0.25, 0.5, 1.0, 1.5}` on the validation set; treat as a
-hyperparameter. Tests: `python -m pytest tests/`.
-
-**Diurnal handling.** Persistence residuals for temperature-cycle
-variables (`tmpf`, `relh`, `feel`) are contaminated by the daily cycle
-at non-24h leads — e.g. an L=12h shift compares noon to midnight, not
-true forecast skill. These columns (listed in `DIURNAL_COLS`) are
-therefore fit only at the diurnal-aligned leads `{24, 48}`; shorter
-leads clamp to σ(24) at transform time via `np.interp`. Non-diurnal
-columns (wind, visibility, pressure, gust, precip) keep the full lead
-grid because their short-lead residuals are honest forecast-error
-proxies. Trade-off: σ(24) is a *conservative* (over-noisy) estimate for
-very short leads on diurnal variables. For a "2 days out" model where
-most flights live in L=12-48, that's fine; the `scale` hyperparameter
-tunes the rest.
-
-## Model training + evaluation pipeline
-
-End-to-end script that trains a per-flight disruption classifier focused on
-the **2-day-out** use case and reports both per-flight and per-occasion
-performance metrics: [src/training_pipeline.py](src/training_pipeline.py).
-
-### What it does
-
-1. **Load + filter**. Reads `data/processed/ord_flights_with_weather_2020_present.parquet`,
-   drops the pre-2021 COVID era.
-2. **Time-based split** (no random shuffling — disruption is heavily
-   autocorrelated across hours, so a random split would leak):
-
-   ```
-   train       2021-01 .. 2025-09
-   validation  2025-10 .. 2025-12
-   test        2026-01 .. (latest)   sealed
-   ```
-
-3. **Sample per-flight lead times** `L_origin ~ Uniform(0, 48 h)` on
-   train and validation (so the model learns lead-conditional decay of
-   weather signal). `L_dest = L_origin + crs_elapsed_h`.
-4. **Inject noise** on every `*_wx_*` column via
-   `WeatherNoiseInjector.transform(..., lead_origin_h, lead_dest_h)`.
-   **Both training AND test use noise** so eval reflects deployment
-   conditions, not a clean-data upper bound.
-5. **Feature engineering**: calendar (cyclic month / hour), schedule,
-   route, lead times, all weather numerics. Categorical columns
-   (`reporting_airline`, `dest`, `dest_state`) use pandas Categorical
-   dtype so sklearn's `HistGradientBoostingClassifier` picks them up
-   natively; unseen levels on val/test become NaN, which the model also
-   handles natively.
-6. **Fit** `HistGradientBoostingClassifier(loss="log_loss", learning_rate=0.05,
-   max_iter=500, early_stopping=True, ...)`.
-7. **Build test occasions**: every 6 h (the GFS refresh cadence) within
-   the test period, gather all flights scheduled in the next 48 h, use
-   each flight's **real** lead at that issue time, inject noise.
-8. **Metrics** at two levels:
-   - **Per flight** (across all test (occasion, flight) rows): AUC-ROC,
-     AUC-PR, Brier, base rate.
-   - **Per occasion** (the actual deliverable): MAE / RMSE / signed bias
-     on aggregate disruption rate, Pearson correlation, severe-window
-     precision/recall (top-decile of actual rates).
-9. **Artifacts** under `artifacts/disruption_model/`:
-   - `model.joblib` — fitted model + frozen category vocabularies
-   - `metrics.json` — every metric above
-   - `per_occasion.csv` — one row per test occasion: `t_issue`,
-     `actual_rate`, `predicted_rate`, `abs_error`, `signed_error`,
-     `n_flights`
-
-### Run
+### Train the production model
 
 ```bash
-# fast iteration: 10% train subsample
-python -m src.training_pipeline --quick
-
-# full run
-python -m src.training_pipeline
-
-# noise-scale sweep (treat as a hyperparameter)
-for s in 0.5 1.0 1.5; do
-    python -m src.training_pipeline --noise-scale $s \
-        --artifacts-dir artifacts/disruption_scale_$s
-done
+python -m src.model.train_production_model
+# → artifacts/production_model/model.joblib + metadata.json
 ```
 
-### Latest results (full run, 1.28 M train rows)
-
-| | |
-|---|---|
-| Test base rate | **0.360** (regime shift vs train ≈ 0.25 — 2026 is busier/worse) |
-| AUC-ROC | 0.716 |
-| AUC-PR | 0.612 (lift ≈ 1.7× over base) |
-| Brier | 0.202 |
-| **Per-occasion MAE on 48 h rate** | **0.088** |
-| Per-occasion RMSE | 0.107 |
-| Per-occasion signed bias | **−0.069** (under-predicts) |
-| Pearson correlation (pred vs actual rate) | 0.88 |
-| Severe-window (top-10%) precision / recall | 0.67 / 0.67 |
-
-### Walk-forward retraining (expanding window)
-
-The pipeline also supports **walk-forward evaluation with an expanding
-train window** — the production-realistic setup where the model is
-re-trained on a fixed cadence and each retrain sees more data than the
-last. Toggle with `--walk-forward`:
+### Experimental training and evaluation
 
 ```bash
-python -m src.training_pipeline --walk-forward --model lgbm \
+python -m src.model.training_pipeline          # full run
+python -m src.model.training_pipeline --quick  # 10% subsample for fast iteration
+
+# Walk-forward retraining (expanding window, LightGBM)
+python -m src.model.training_pipeline --walk-forward --model lgbm \
     --retrain-every-days 30 --first-test-start 2025-07-01
 ```
 
-At step `i` with boundary `T_i`:
+---
 
-- **train** on every flight scheduled before `T_i` (window *grows* each step),
-- carve the last `--val-days` (default 30) of train as a time-ordered
-  val slice for early stopping,
-- **test** per-occasion 48 h forecasts for issue times in
-  `[T_i, T_i + retrain_every_days)`.
+## How the Model Works
 
-Useful flags: `--model {hgb,lgbm}` (LightGBM strongly recommended for
-walk-forward — it's faster and the production model class for this
-pipeline), `--retrain-every-days N`, `--first-test-start YYYY-MM-DD`,
-`--val-days N`.
+**Task.** At each 6-hour GFS refresh "occasion", score every ORD departure
+scheduled in the next 48 h with `P(disrupted)`, then aggregate to a
+48 h disruption-rate forecast.
 
-Three artifacts are written:
+**Features.**
+- Calendar: cyclic month/hour encoding, `days_since_2021` (linear time trend)
+- Schedule: airline, destination, route, flight number, `crs_elapsed_time`
+- Weather at ORD (departure hour) and destination (arrival hour): wind, gusts,
+  visibility, ceiling, temperature, precipitation, pressure — ~25 wx columns per endpoint
+- Trailing airport disruption rates over 6 h / 24 h / 72 h / 168 h lookback windows
+  (indexed by scheduled arrival so they never look forward from the issue time)
+- Lead time from issue moment to scheduled departure
 
-```
-artifacts/disruption_model/
-  walkforward_step_metrics.csv      # one row per retrain step
-  walkforward_per_occasion.parquet  # one row per (step, occasion)
-  walkforward_per_flight.parquet    # one row per (step, occasion, flight)
-```
+**Weather noise injection.** At training time the model sees clean historical
+observations; at inference it sees NWS forecasts. To close this train/serve gap,
+lead-time-aware Gaussian noise is added to every `*_wx_*` column during training:
 
-The dedicated EDA notebook is
-[notebooks/walkforward_eda.ipynb](notebooks/walkforward_eda.ipynb) —
-metric trajectories, calibration bias over time, per-step calibration
-plot, per-occasion error distributions, per-step predicted-vs-actual
-scatter grid, and Brier stratified by lead bin per step.
+$$
+\sigma(L) = \operatorname{std}( v(t) − v(t − L) )   \quad \text{pooled across stations}
+$$
 
-### EDA + multi-model comparison notebook
+Noise kind is matched to the variable type (additive, non-negative clipped,
+circular, bounded, log-normal for precipitation). `scale` is a hyperparameter
+swept on the validation set.
 
-[notebooks/disruption_model_eda.ipynb](notebooks/disruption_model_eda.ipynb)
-walks through the data and compares three models on the same
-noise-injected train/test split: **logistic regression** (baseline),
-**LightGBM**, and **HistGradientBoosting** (the production model). It
-includes time-series of disruption rate, per-carrier and per-destination
-breakdowns, weather-vs-disruption distributions, per-flight and
-per-occasion metrics, a calibration plot overlay across the three models,
-predicted-vs-actual occasion scatterplots, and **LightGBM feature
-importance** in three views (split count, gain, and permutation
-importance on the test set). Headline:
+**Model.** LightGBM (`LGBMClassifier`, `binary` objective). Trained with a
+time-based split (no random shuffling — disruption is autocorrelated across
+hours):
 
 ```
-          AUC-ROC  AUC-PR  Brier
-Logistic   0.666   0.529  0.220   <- linear; meaningfully weaker
-LightGBM   0.720   0.618  0.200   <- best (marginally)
-HistGBT    0.716   0.612  0.202   <- production; essentially tied
+train       2021-01 – 2025-09
+validation  2025-10 – 2025-12   (early stopping)
+test        2026-01 – latest
 ```
 
-Cell outputs are baked in, so opening the notebook shows results
-immediately. To re-execute:
+**Production model differences.** The dashboard serves a separate production
+artifact that (1) drops `n_reports` (a METAR diagnostic unavailable in NWS
+forecasts) and (2) trains on all labelled data with the last 30 days as the
+validation slice.
+
+**Latest results** (walk-forward LightGBM, 9 monthly retrains 2025-07 → 2026-02):
+
+| metric | value |
+|---|---|
+| Per-occasion MAE (48 h rate) | 0.072 |
+| Mean \|bias\| | 0.039 |
+| AUC-ROC | 0.694 |
+| Pearson r (pred vs actual rate) | — |
+
+---
+
+## Starting the Dashboard
+
+> **Shortcut:** `./start_app.sh` launches the dashboard (pass
+> `AERODATABOX_KEY=<key> ./start_app.sh` to enable the Live source).
 
 ```bash
-.venv/bin/jupyter nbconvert --to notebook --execute --inplace \
-    --ExecutePreprocessor.timeout=900 notebooks/disruption_model_eda.ipynb
-```
-
-### Engineered operational + trend features
-
-Two cheap, leak-free features address the systematic under-prediction
-bias the model showed before:
-
-- **`trailing_disruption_rate_{6,24,72,168}h`** — disruption rate over
-  ORD flights whose *scheduled arrival* falls in
-  `[t_now − W, t_now)`, where `t_now = scheduled_dep − lead_origin_h`.
-  Captures cascading delays, weather-aftermath state, ATC/crew
-  disruption, holiday spikes.
-
-  **On leakage.** The natural-sounding "trailing rate of flights
-  scheduled to depart in the last W hours" leaks: it includes flights
-  whose scheduled arrival is *after* `t_now` (still in the air at
-  prediction time), whose arrival-delay labels aren't yet realised in
-  production. Indexing by **scheduled arrival** with a strict-less-than
-  bound fixes this — every flight in the window has had time to
-  realise its full `disrupted` label before `t_now`. The fix is
-  verified by a smoke test that puts the only disrupted flight at the
-  window edge and checks it's excluded until its arrival passes.
-  Empirically the leak cost ≈ 0 (v3 leak-free is within 0.0001 MAE
-  of leaky v2) — most of the trailing-rate signal lives in flights
-  that fully landed hours ago, not in-flight ones.
-- **`days_since_2021`** — linear time trend. Lets the model lean into
-  the post-COVID-recovery upward drift instead of regressing to the
-  long-run average.
-
-In production these would be sourced from a real-time ops feed
-(ASDI/ASPM/airline ops); during backtest we compute them from BTS
-labels available strictly before `t_now`. Implementation:
-[src/training_pipeline.py:add_trailing_disruption_features](src/training_pipeline.py).
-Vectorised via prefix sums, so all four lookback windows for ~1.4 M
-flights complete in well under a second per walk-forward step.
-
-Walk-forward LightGBM, **before vs after** adding these features
-(monthly retrains, 9 steps from 2025-07 → 2026-02):
-
-| metric                 | before | after  | change |
-|---|---:|---:|---:|
-| mean per-occasion MAE  | 0.0910 | 0.0724 | **−20.4 %** |
-| mean &#124;bias&#124;  | 0.0740 | 0.0390 | **−47.3 %** |
-| mean AUC-ROC           | 0.6878 | 0.6940 | +0.006 |
-| Dec-2025 step MAE      | 0.186  | 0.106  | **−43 %** (holiday spike) |
-
-The AUC barely moved, which is the correct interpretation: the model
-already *ranked* flights well, it just couldn't tell **what regime**
-the airport was in. Several signed-bias values flipped from stubbornly
-negative to small and zero-centred — exactly the calibration shape a
-post-hoc isotonic recalibrator can finish cleaning up.
-
-**Known issues** worth iterating on:
-
-- **Systematic under-prediction.** The −7 pp bias is almost certainly a
-  regime shift between train (2021–2025, post-COVID recovery) and test
-  (2026, busier era with higher base disruption). Quick fixes: (a) fit a
-  post-hoc isotonic calibrator on validation; (b) include a recency
-  weight in training; (c) add a "year" or "trailing-30d-disruption-rate"
-  feature. The Pearson r of 0.88 says the *ranking* is good — only the
-  level is off.
-- **Severe-window recall is only 0.67** at the top decile — the model
-  catches two out of three of the worst 48 h windows. Lifting this is
-  where calibration + a `trailing_disruption_rate` operational feature
-  would help most.
-
-## Real-time serving: live data collection
-
-The training pipeline is a backtest over BTS history. To drive a live
-dashboard (refresh every 15 min on EC2) the same feature frame must be
-rebuilt from **real-time** sources. Three collectors do this; their
-output composes into the exact schema `prepare_features` +
-`join_flights_weather` expect, so the serve path reuses the training
-transforms (no train/serve skew by construction).
-
-| module | job | provider |
-|---|---|---|
-| [src/live_flights.py](src/live_flights.py) | next-48 h ORD departure schedule **and** recent completed flights | AeroDataBox via API.Market (swappable) |
-| [src/live_weather.py](src/live_weather.py) | hourly weather forecast per airport, mapped to the model wx schema | NWS `api.weather.gov` (free, US) |
-| [src/trailing_state.py](src/trailing_state.py) | as-of-now `trailing_disruption_rate_*` + `days_since_2021` | derived from recent completed flights |
-
-```bash
-# 1. forward schedule for the next 48 h (needs an AeroDataBox key)
-AERODATABOX_KEY=... python -m src.live_flights schedule
-# 2. recent completed flights (last 168 h) for the trailing rate
-AERODATABOX_KEY=... python -m src.live_flights recent --lookback-h 168
-# Optional: seed the dashboard's rolling trailing-rate cache in one shot
-AERODATABOX_KEY=... python -m src.live_flights backfill-cache --lookback-h 168
-# Same seed, explicitly paced under the gateway's ~1 request/second limit
-python -m src.backfill_recent_cache --lookback-h 168 --chunk-h 12 --sleep-s 1.5
-# 3. weather forecasts for ORD + every destination in the schedule
-python -m src.live_weather --flights data/live/flights_next48h.parquet
-```
-
-**Why AeroDataBox over FlightAware AeroAPI.** AeroAPI returns airport
-results in 15-record result sets, and a Personal-tier key is capped at ~10
-result sets/minute. ORD has ~1,200+ departures in a 48 h window (80+ result
-sets), so just fetching the forward schedule could take minutes — and the
-recent-history pull made it worse. AeroDataBox's **FIDS "airport
-departures/arrivals by local time range"** endpoint returns *every*
-departure in a window in one request — no 15-record paging. The window is
-capped at **12 h** by the API (verified against the OpenAPI spec), so the
-next-48 h schedule is four chunked calls (~4 s) and a 168 h history is
-`ceil(168/12)=14` chunked calls. It is also cheap: the endpoint is **Tier 2
-(2 API units/request)**, so a full schedule refresh is ~8 units — fractions
-of a cent on API.Market's low-cost plans. Auth is the `x-magicapi-key`
-header against `https://prod.api.market/api/v1/aedbx/aerodatabox`.
-
-**Marketplace (API.Market vs RapidAPI).** AeroDataBox is resold through
-several gateways that proxy the *same* API (identical path, params, Tier 2,
-response). Pick the one your **key** is from with `AERODATABOX_PROVIDER`
-(default `apimarket`; the dashboard also has a "Marketplace" selector under
-the Live source). They differ only in base URL + auth headers:
-
-| provider | base URL | auth header(s) |
-|---|---|---|
-| `apimarket` (default) | `prod.api.market/api/v1/aedbx/aerodatabox` | `x-magicapi-key` |
-| `rapidapi` | `aerodatabox.p.rapidapi.com` | `X-RapidAPI-Key` + `X-RapidAPI-Host` |
-
-```bash
-# example: a RapidAPI key
-AERODATABOX_PROVIDER=rapidapi AERODATABOX_KEY=... python -m src.live_flights schedule
-# or per-invocation: python -m src.live_flights schedule --provider rapidapi
-```
-
-**Two layers of caching keep costs near zero.**
-
-1. *Raw-response TTL cache* (`data/live/cache/aerodatabox/`, env
-   `AERODATABOX_CACHE_TTL_S`, default 600 s) dedupes identical FIDS calls —
-   e.g. the four schedule chunks of one refresh, or repeated CLI runs.
-2. *Rolling normalized parquet cache* — the **Live** dashboard avoids
-   re-pulling the full 168 h recent history on every refresh: it fetches a
-   small recent window (`AERODATABOX_RECENT_CACHE_REFRESH_H`, default 3 h),
-   appends/dedupes it into `data/live/flights_recent_cache.parquet`, and
-   keeps a rolling 168 h cache (`AERODATABOX_RECENT_CACHE_RETENTION_H`).
-   During cold start, any trailing-rate window the cache does not yet cover
-   falls back to the latest local BTS trailing-state snapshot; once the
-   cache has aged in, those windows become genuinely live.
-
-So steady-state cost is ~4 schedule chunks + 1 recent chunk ≈ 5 requests
-(~10 units) per refresh. To make the 168 h trailing rate representative
-immediately, run `backfill-cache` once before starting the dashboard, or use
-`src.backfill_recent_cache` to walk newest-to-oldest in ≤12 h chunks,
-sleeping ~1.5 s between calls to stay under the gateway's ~1 req/s limit.
-
-**Two clocks.** The model is *retrained* slowly (monthly) and serialized
-to S3; the dashboard *refreshes* fast (15 min) by re-running the three
-collectors, joining, scoring, and aggregating to the per-occasion 48 h
-rate. The 15-min loop never retrains.
-
-**The trailing rate does not look forward.** `t_now` is the issue time,
-not the flight's departure. Every flight in the next-48 h batch shares
-one trailing-rate snapshot computed over ORD flights that *already
-completed* in the last `{6,24,72,168} h` (indexed by scheduled arrival,
-strict `< t_now`, so each averaged flight has realised its full label).
-The flight 2 h out and the flight 36 h out get the **same** value — it's
-"how disrupted has ORD been recently", not anything about the future.
-See the [src/trailing_state.py](src/trailing_state.py) module docstring.
-
-**Provider notes / train-serve skew.** The flight adapter is abstracted
-behind a normalized schema (`aerodatabox_to_normalized`); swapping
-AeroDataBox for FlightAware/AviationStack/OAG/Cirium is a one-function change.
-NWS does not forecast every field the ASOS observations carried —
-`vsby`, `mslp`, `alti`, `peak_wind_gust`, `snowdepth` and `n_reports`
-come back NaN (the model handles NaN natively). `n_reports` ranked high
-in importance, so its absence is the biggest skew; consider retraining
-the live model without it. International destinations are outside NWS
-coverage and get NaN weather (use a global provider if needed).
-
-`tests/test_live_collection.py` pins the pure transforms (unit
-conversions, HHMM/UTC derivation, distance, trailing-window boundaries).
-
-## Production model + recent-week deployment test
-
-The dashboard serves a dedicated production artifact, **not** the
-experimental `training_pipeline` model. Two deliberate differences:
-
-- **No `*_wx_n_reports` feature.** `n_reports` is the count of sub-hourly
-  METARs behind each historical weather row — a diagnostic of the
-  *observation* stream with no forecast equivalent (NWS returns NaN for
-  it, see [src/live_weather.py](src/live_weather.py)). Keeping it would
-  train on a feature that is always missing at serve time. The production
-  model drops it from both endpoints.
-- **No isotonic calibrator.** Shipped raw (calibration is a
-  downstream-consumer choice; see
-  [notebooks/lightgbm_investigation.ipynb](notebooks/lightgbm_investigation.ipynb)).
-
-```bash
-# train the production LightGBM on ALL labelled data (val = last 30 days)
-python -m src.train_production_model
-```
-
-Writes a deployable bundle to `artifacts/production_model/`:
-`model.joblib` (model + frozen category vocab + `feature_names`),
-`model.txt` (LightGBM native dump — portable across library versions),
-and `metadata.json` (feature list, vocabularies, **pinned library
-versions**, train window, base rate, validation metrics). Upload the
-folder to S3; the serve loop loads `model.joblib`, selects
-`metadata["feature_names"]`, and predicts.
-
-### Recent-week deployment-realism test
-
-```bash
-python -m src.evaluate_recent_week
-```
-
-Trains on every flight before the most recent labelled week, then scores
-per-occasion 48 h forecasts across that week under **forecast
-conditions** (weather-noise proxy — a true live-forecast-vs-label test is
-impossible offline because retrievable NWS forecasts and BTS ground truth
-never overlap in time; the noise injector is the project's sanctioned
-forecast simulator). It trains two variants to quantify the cost of
-dropping `n_reports`. Latest run (test week **2026-02-22 → 03-01**, 21
-occasions, including the Feb 22–23 disruption spike):
-
-| variant | features | AUC | Brier | per-occasion MAE | bias | Pearson r |
-|---|---:|---:|---:|---:|---:|---:|
-| **production (no `n_reports`)** | 55 | 0.661 | 0.205 | **0.034** | −0.031 | **0.972** |
-| with `n_reports` | 57 | 0.665 | 0.204 | 0.031 | −0.027 | 0.970 |
-
-Dropping `n_reports` costs ≈ **0.005 AUC / 0.004 MAE** — a small,
-acceptable price for eliminating the train/serve skew. The production
-model tracks the week's disruption-rate trajectory tightly (Pearson 0.97,
-MAE 0.034) with a slight regime-drift under-prediction. Artifacts:
-`recent_week_eval.{json,png}` and `recent_week_per_occasion.parquet`.
-
-> A *genuine* live test (real forecasts vs realised labels) requires
-> running a forward snapshot harness: capture today's forecast-driven
-> predictions, then score them a week later against actual outcomes.
-
-## Dashboard (Streamlit)
-
-A web dashboard shows the production model's `P(disrupted)` for every ORD
-departure in the next 48 h, with a refresh button, search bar, and
-filtering. The serving layer [src/serve.py](src/serve.py) ties the three
-collectors + production model into one `predict_next_48h()` call (the
-"prediction API"); [dashboard/app.py](dashboard/app.py) is presentation
-only.
-
-```bash
-# default: genuine next 48 h (no API key needed)
+# Default mode: projected next-48 h schedule + live NWS weather (no key needed)
 .venv/bin/streamlit run dashboard/app.py
 
-# live AeroDataBox schedule instead of the projection
-AERODATABOX_KEY=... .venv/bin/streamlit run dashboard/app.py
+# Live mode: real AeroDataBox schedule + live NWS weather
+AERODATABOX_KEY=<key> .venv/bin/streamlit run dashboard/app.py
 ```
 
-Three data sources, one scoring core ([src/serve.py](src/serve.py)):
+Three data sources are available in the dashboard UI:
 
-| source | flights | weather | ground truth | key |
-|---|---|---|---|---|
-| **Next 48 h** (default) | ORD's recent schedule **projected onto the real upcoming dates** (real carriers/flight numbers/routes/times, matched by weekday) | **live NWS forecast** | — (future) | no |
-| **Historical replay** | a real labelled 48 h window | already joined | ✓ predicted-vs-actual | no |
-| **Live** | real next-48 h schedule via AeroDataBox | live NWS forecast | — | AeroDataBox |
+| Source | Flights | Weather | Ground truth |
+|---|---|---|---|
+| **Next 48 h** (default) | Recent schedule projected onto upcoming dates (same weekday) | Live NWS forecasts | — |
+| **Historical replay** | Real labelled 48 h window | Joined observations | Predicted vs actual |
+| **Live** | Real AeroDataBox schedule | Live NWS forecasts | — |
 
-> Why a *projection* for "Next 48 h": there is no free, no-key source for
-> the future ORD schedule, but ORD's operation is strongly weekly-periodic,
-> so re-stamping the most recent same-weekday schedule onto the upcoming
-> dates is a realistic (not guaranteed) stand-in. The **weather is genuinely
-> live** (NWS forecasts for the real upcoming hours, ~150 airports fetched
-> concurrently in ~10 s). The trailing operational rate uses the most
-> recent *known* airport state, since the as-of-now window post-dates the
-> labelled data. For the literal live schedule, use the Live source.
+---
 
-Features:
-- **Headline metrics** — predicted 48 h disruption rate, flight count,
-  high-risk count; in replay mode also the realised rate (predicted vs
-  actual).
-- **Trajectory + risk mix** — predicted rate by departure hour, and a
-  Low/Moderate/Elevated/High risk histogram.
-- **Refresh button** — re-fetches from the prediction APIs and re-scores
-  (busts the cache); search and filters apply instantly without a
-  refetch.
-- **Search + filter** — free-text search (flight #, airline, dest, city),
-  multiselect airline/dest/risk, and `P(disrupted)` / lead-time sliders;
-  plus a filtered-CSV download.
+## Tests
 
-Two data sources feed one scoring core, so demo and live render
-identically. The script is covered by a headless `AppTest` check (renders
-without error; search/filter/refresh behave).
-
-### Layout
-
-```
-src/ingest_bts_ord.py        # flights: download + per-month raw save (CLI)
-src/clean_bts_ord.py         # flights: combine + clean + label + validate
-src/ingest_iem_asos.py       # weather: multi-station, batched IEM ingest
-src/clean_iem_asos.py        # weather: per-station clean + combined long table
-src/ingest_dest_weather.py   # orchestrator: weather for every dest + ORD
-src/join_flights_weather.py  # join flights + origin/dest weather (UTC-correct)
-src/weather_noise.py         # train-time noise injection (CLI: fit)
-src/training_pipeline.py     # split + features + noise + fit + occasion eval
-src/live_flights.py          # serve: AeroDataBox next-48h schedule + recent (CLI)
-src/live_weather.py          # serve: NWS hourly forecast -> model wx schema (CLI)
-src/trailing_state.py        # serve: as-of-now trailing disruption rate
-src/train_production_model.py # production LightGBM (no n_reports, no isotonic)
-src/evaluate_recent_week.py  # deployment-realism backtest on the recent week
-src/serve.py                 # prediction API: collectors + model -> per-flight P
-dashboard/app.py             # Streamlit dashboard (refresh, search, filtering)
-tests/test_weather_noise.py  # pytest suite for the noise injector
-tests/test_live_collection.py # pytest suite for the live collectors
-notebooks/disruption_model_eda.ipynb  # EDA + LR vs LightGBM vs HistGBT + calibration
-notebooks/walkforward_eda.ipynb       # walk-forward (expanding window) metric trajectories
-
-data/raw/bts_ontime_ord/YYYY_MM.parquet                       # raw flights
-data/raw/iem_asos/{STATION}/YYYY_MM.csv                       # raw weather
-data/processed/ord_departures_bts_2020_present.parquet        # processed flights
-data/processed/weather/{STATION}_iem_2020_present.parquet     # per-station weather
-data/processed/dest_weather_iem_2020_present.parquet          # combined long weather
-data/processed/ord_flights_with_weather_2020_present.parquet  # joined final table
-data/processed/weather_noise_sigmas.json                      # noise σ table
-artifacts/disruption_model/
-  model.joblib, metrics.json, per_occasion.csv     (single-shot)
-  walkforward_step_metrics.csv, walkforward_per_{occasion,flight}.parquet
-artifacts/production_model/
-  model.joblib, model.txt, metadata.json           (deployable bundle)
-  recent_week_eval.{json,png}, recent_week_per_occasion.parquet
+```bash
+python -m pytest tests/
 ```
 
-`data/` is git-ignored — it is large and fully reproducible from the
-scripts above.
+---
+
+## Directory Structure
+
+```
+plane_forecasting/
+├── download_data.sh                   # Build the full dataset (runs the data pipeline)
+├── train_model.sh                     # Train the production model + recent-week backtest
+├── start_app.sh                       # Launch the Streamlit dashboard
+├── src/
+│   ├── data/                          # Historical data ingestion and processing
+│   │   ├── ingest_bts_ord.py          # Download BTS on-time flight records month-by-month
+│   │   ├── clean_bts_ord.py           # Combine, clean, label, and validate flight data
+│   │   ├── ingest_iem_asos.py         # Download IEM ASOS weather observations (multi-station)
+│   │   ├── clean_iem_asos.py          # Aggregate sub-hourly METARs to one row per UTC hour
+│   │   ├── ingest_dest_weather.py     # Orchestrate weather ingestion for all destination airports
+│   │   └── join_flights_weather.py    # Join flights with origin + destination weather (UTC-correct)
+│   ├── model/                         # Model training, noise injection, and evaluation
+│   │   ├── weather_noise.py           # Lead-time-aware noise injection (fit sigma table + transform)
+│   │   ├── training_pipeline.py       # Split → features → noise → fit → per-occasion evaluation
+│   │   ├── train_production_model.py  # Train the deployable LightGBM (no n_reports)
+│   │   ├── evaluate_recent_week.py    # Deployment-realism backtest on the most recent week
+│   │   └── validate_calibration_full.py  # CatBoost + isotonic calibration validation
+│   ├── live/                          # Real-time data collection for the dashboard
+│   │   ├── live_flights.py            # AeroDataBox next-48 h schedule + recent completed flights
+│   │   ├── live_weather.py            # NWS hourly forecasts mapped to the model weather schema
+│   │   ├── trailing_state.py          # As-of-now trailing disruption rate (operational feature)
+│   │   └── backfill_recent_cache.py   # Seed the rolling flight cache (rate-limited)
+│   └── serve.py                       # Prediction API: collectors + model → per-flight P(disrupted)
+├── dashboard/
+│   └── app.py                         # Streamlit dashboard (refresh, search, filter, replay mode)
+├── notebooks/
+│   ├── disruption_model_eda.ipynb     # EDA + logistic vs LightGBM vs HistGBT comparison
+│   ├── production_model.ipynb         # Production model analysis and calibration plots
+│   ├── walkforward_eda.ipynb          # Walk-forward metric trajectories over time
+│   └── lightgbm_investigation.ipynb   # LightGBM hyperparameter and calibration investigation
+├── tests/
+│   ├── test_weather_noise.py          # Unit tests for the noise injector
+│   └── test_live_collection.py        # Unit tests for the live collectors
+├── artifacts/
+│   ├── disruption_model/              # Experimental model artifacts (model.joblib, metrics.json)
+│   └── production_model/              # Deployable bundle (model.joblib, model.txt, metadata.json)
+├── data/                              # Raw + processed data (git-ignored, reproducible from scripts)
+└── requirements.txt
+```
