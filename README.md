@@ -157,7 +157,7 @@ observations; at inference it sees NWS forecasts. To close this train/serve gap,
 lead-time-aware Gaussian noise is added to every `*_wx_*` column during training:
 
 $$
-\sigma(L) = \operatorname{std}( v(t) − v(t − L) )   \quad \text{pooled across stations}
+\sigma(L) = \text{std}( v(t) − v(t − L) )   \quad \text{pooled across stations}
 $$
 
 Noise kind is matched to the variable type (additive, non-negative clipped,
