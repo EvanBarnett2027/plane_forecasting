@@ -20,7 +20,11 @@ aeroapi.key
 .streamlit/secrets.toml
 data/live/
 
+# Script run logs (download_data.sh / train_model.sh)
+logs/
+
 # Misc
 presentation/
 catboost_info/
 docs/
+*/catboost_info
