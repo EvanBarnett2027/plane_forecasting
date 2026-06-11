@@ -69,7 +69,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-from src.ingest_bts_ord import PROJECT_ROOT
+from src.data.ingest_bts_ord import PROJECT_ROOT
 
 logger = logging.getLogger("live_flights")
 

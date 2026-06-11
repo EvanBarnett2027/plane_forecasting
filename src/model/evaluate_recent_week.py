@@ -59,17 +59,17 @@ from sklearn.metrics import (
     average_precision_score, brier_score_loss, roc_auc_score,
 )
 
-from src.ingest_bts_ord import PROJECT_ROOT
-from src.train_production_model import (
+from src.data.ingest_bts_ord import PROJECT_ROOT
+from src.model.train_production_model import (
     DEFAULT_ARTIFACTS, LGBM_PARAMS, PRODUCTION_DROP, drop_production_features,
 )
-from src.training_pipeline import (
+from src.model.training_pipeline import (
     DEFAULT_JOINED, DEFAULT_SIGMAS, TRAIN_START_DEFAULT, WINDOW_H,
     OCCASION_STEP_H,
     add_long_term_trend, add_sampled_leads, add_trailing_disruption_features,
     build_test_occasions, inject_noise, per_occasion_table, prepare_features,
 )
-from src.weather_noise import WeatherNoiseInjector
+from src.model.weather_noise import WeatherNoiseInjector
 
 logger = logging.getLogger("evaluate_recent_week")
 

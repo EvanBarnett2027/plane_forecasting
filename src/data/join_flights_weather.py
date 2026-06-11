@@ -42,7 +42,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.ingest_bts_ord import PROJECT_ROOT
+from src.data.ingest_bts_ord import PROJECT_ROOT
 
 logger = logging.getLogger("join_flights_weather")
 

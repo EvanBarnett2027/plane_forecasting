@@ -62,8 +62,8 @@ import numpy as np
 import pandas as pd
 import requests
 
-from src.ingest_bts_ord import PROJECT_ROOT
-from src.live_flights import DEFAULT_LIVE_DIR, airport_info
+from src.data.ingest_bts_ord import PROJECT_ROOT
+from src.live.live_flights import DEFAULT_LIVE_DIR, airport_info
 
 logger = logging.getLogger("live_weather")
 
@@ -281,7 +281,7 @@ def main(argv=None) -> int:
         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 
     if args.flights:
-        from src.live_flights import distinct_stations
+        from src.live.live_flights import distinct_stations
         feats = pd.read_parquet(args.flights)
         stations = distinct_stations(feats, origin=args.origin)
     else:

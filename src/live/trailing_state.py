@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from src.training_pipeline import (
+from src.model.training_pipeline import (
     TRAILING_DISRUPTION_WINDOWS_H,
     _REFERENCE_DATE,
     _SECONDS_PER_HOUR,

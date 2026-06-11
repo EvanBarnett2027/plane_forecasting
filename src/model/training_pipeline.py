@@ -63,8 +63,8 @@ except ImportError:  # optional dependency for --model lgbm
 
 MODEL_CHOICES = ("hgb", "lgbm")
 
-from src.ingest_bts_ord import PROJECT_ROOT
-from src.weather_noise import WeatherNoiseInjector
+from src.data.ingest_bts_ord import PROJECT_ROOT
+from src.model.weather_noise import WeatherNoiseInjector
 
 logger = logging.getLogger("training_pipeline")
 

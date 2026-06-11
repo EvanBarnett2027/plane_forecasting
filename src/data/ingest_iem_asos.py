@@ -57,7 +57,7 @@ import pandas as pd
 import requests
 from tqdm import tqdm
 
-from src.ingest_bts_ord import PROJECT_ROOT, month_iter
+from src.data.ingest_bts_ord import PROJECT_ROOT, month_iter
 
 logger = logging.getLogger("ingest_iem_asos")
 

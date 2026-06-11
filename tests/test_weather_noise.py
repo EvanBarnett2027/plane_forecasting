@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.weather_noise import (
+from src.model.weather_noise import (
     BOUNDED_COLS,
     WeatherNoiseInjector,
     _broadcast,

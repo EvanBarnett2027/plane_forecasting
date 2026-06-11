@@ -52,8 +52,8 @@ from sklearn.metrics import (
 import lightgbm as lgb
 from catboost import CatBoostClassifier
 
-from src.ingest_bts_ord import PROJECT_ROOT
-from src.training_pipeline import (
+from src.data.ingest_bts_ord import PROJECT_ROOT
+from src.model.training_pipeline import (
     DEFAULT_JOINED,
     DEFAULT_SIGMAS,
     TRAIN_START_DEFAULT,
@@ -70,7 +70,7 @@ from src.training_pipeline import (
     per_occasion_table,
     prepare_features,
 )
-from src.weather_noise import WeatherNoiseInjector
+from src.model.weather_noise import WeatherNoiseInjector
 
 logger = logging.getLogger("validate_calibration_full")
 

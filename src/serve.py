@@ -31,11 +31,11 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from src.ingest_bts_ord import PROJECT_ROOT
-from src.training_pipeline import (
+from src.data.ingest_bts_ord import PROJECT_ROOT
+from src.model.training_pipeline import (
     DEFAULT_JOINED, WINDOW_H, _REFERENCE_DATE, prepare_features,
 )
-from src.trailing_state import (
+from src.live.trailing_state import (
     attach_operational_features, compute_trailing_rates_asof, label_disrupted,
 )
 
@@ -160,7 +160,7 @@ class Prediction:
 
 
 def _airport_name(iata: str) -> str:
-    from src.live_flights import airport_info
+    from src.live.live_flights import airport_info
     info = airport_info(iata)
     city = info.get("city") or info.get("name") or ""
     return str(city)
@@ -284,7 +284,7 @@ def project_schedule_next_48h(now: pd.Timestamp, history: pd.DataFrame, *,
     America/Chicago and converted to UTC, yielding a realistic (not
     guaranteed) next-48 h schedule on genuine upcoming timestamps.
     """
-    from src.clean_bts_ord import _hhmm_to_local_datetime
+    from src.data.clean_bts_ord import _hhmm_to_local_datetime
 
     now = pd.Timestamp(now)
     if now.tz is None:
@@ -355,8 +355,8 @@ def predict_upcoming(now: pd.Timestamp | None = None,
                 len(flights), now, WINDOW_H)
 
     if weather:
-        from src.live_flights import distinct_stations
-        from src.live_weather import fetch_forecasts
+        from src.live.live_flights import distinct_stations
+        from src.live.live_weather import fetch_forecasts
         stations = distinct_stations(flights, origin=origin)
         logger.info("upcoming: fetching live NWS forecasts for %d airports",
                     len(stations))
@@ -387,12 +387,12 @@ def predict_live(api_key: str, now: pd.Timestamp | None = None,
                  origin: str = "ORD", lookback_h: int = 168,
                  recent_refresh_h: int | None = None,
                  joined: Path = DEFAULT_JOINED) -> Prediction:
-    from src.live_flights import (
+    from src.live.live_flights import (
         DEFAULT_RECENT_CACHE_REFRESH_H,
         build_flight_features, distinct_stations, fetch_scheduled_departures,
         update_recent_departures_cache,
     )
-    from src.live_weather import fetch_forecasts
+    from src.live.live_weather import fetch_forecasts
 
     now = pd.Timestamp(now or datetime.now(timezone.utc))
     if now.tz is None:

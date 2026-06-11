@@ -42,8 +42,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.ingest_iem_asos import DEFAULT_RAW_ROOT, station_dir
-from src.ingest_bts_ord import PROJECT_ROOT
+from src.data.ingest_iem_asos import DEFAULT_RAW_ROOT, station_dir
+from src.data.ingest_bts_ord import PROJECT_ROOT
 
 logger = logging.getLogger("clean_iem_asos")
 

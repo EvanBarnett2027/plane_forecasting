@@ -14,8 +14,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.backfill_recent_cache import iter_backfill_windows, run_backfill
-from src.live_flights import (
+from src.live.backfill_recent_cache import iter_backfill_windows, run_backfill
+from src.live.live_flights import (
     aerodatabox_to_normalized,
     backfill_recent_departures_cache,
     build_flight_features,
@@ -30,12 +30,12 @@ from src.live_flights import (
     update_recent_departures_cache,
     state_abbrev,
 )
-from src.live_weather import (
+from src.live.live_weather import (
     WX_COLS,
     _duration_hours,
     gridpoints_to_hourly,
 )
-from src.trailing_state import (
+from src.live.trailing_state import (
     compute_trailing_rates_asof,
     label_disrupted,
 )
@@ -189,7 +189,7 @@ def test_fetch_fids_departures_chunks_and_dedupes(monkeypatch):
             _adb_flight("UA 1", "UA", "DEN",
                         "2026-05-25T14:00:00Z", "2026-05-25T16:00:00Z")]}
 
-    monkeypatch.setattr("src.live_flights._aerodatabox_get", fake_get)
+    monkeypatch.setattr("src.live.live_flights._aerodatabox_get", fake_get)
     now = pd.Timestamp("2026-05-25T12:00:00Z").to_pydatetime()
     flights = fetch_fids_departures(
         "secret", origin="ORD", start_utc=now,
@@ -245,7 +245,7 @@ def test_aerodatabox_get_uses_ttl_cache(monkeypatch, tmp_path):
         assert "x-magicapi-key" in headers
         return _FakeResp({"departures": [{"number": "UA 1"}]})
 
-    monkeypatch.setattr("src.live_flights.requests.get", fake_requests_get)
+    monkeypatch.setattr("src.live.live_flights.requests.get", fake_requests_get)
 
     kwargs = dict(timeout=5, retries=1, cache_ttl=600, cache_dir=tmp_path)
     a = _aerodatabox_get("/p", {"x": "1"}, "secret", **kwargs)
@@ -300,7 +300,7 @@ def test_update_recent_departures_cache_appends_dedupes_and_prunes(
         seen.update(api_key=api_key, origin=origin, lookback_h=lookback_h)
         return fresh
 
-    monkeypatch.setattr("src.live_flights.fetch_recent_departures",
+    monkeypatch.setattr("src.live.live_flights.fetch_recent_departures",
                         fake_recent)
     cache = update_recent_departures_cache(
         "secret", origin="ORD", now=now.to_pydatetime(), refresh_h=3,
@@ -336,7 +336,7 @@ def test_backfill_recent_departures_cache_writes(monkeypatch, tmp_path):
         seen.update(api_key=api_key, origin=origin, lookback_h=lookback_h)
         return fresh
 
-    monkeypatch.setattr("src.live_flights.fetch_recent_departures",
+    monkeypatch.setattr("src.live.live_flights.fetch_recent_departures",
                         fake_recent)
     cache = backfill_recent_departures_cache(
         "secret", origin="ORD", now=now.to_pydatetime(), lookback_h=168,
@@ -381,7 +381,7 @@ def test_run_slow_backfill_writes_each_chunk(monkeypatch, tmp_path):
             "arr_del15": 0,
         }])
 
-    monkeypatch.setattr("src.backfill_recent_cache.fetch_recent_departures",
+    monkeypatch.setattr("src.live.backfill_recent_cache.fetch_recent_departures",
                         fake_recent)
     cache_path = tmp_path / "recent_cache.parquet"
     cache = run_backfill(
