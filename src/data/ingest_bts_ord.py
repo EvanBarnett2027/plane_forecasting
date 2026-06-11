@@ -108,7 +108,8 @@ FIELDS = [
     "LateAircraftDelay",
 ]
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+# src/data/ingest_bts_ord.py -> parents[2] is the project root.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RAW_DIR = PROJECT_ROOT / "data" / "raw" / "bts_ontime_ord"
 
 # --------------------------------------------------------------------------- #
