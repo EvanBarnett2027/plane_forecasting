@@ -1,5 +1,6 @@
 .venv/
 .claude
+.DS_Store
 .pytest_cache
 __pycache__/
 *.pyc
@@ -18,3 +19,8 @@ aeroapi.key
 .env.*
 .streamlit/secrets.toml
 data/live/
+
+# Misc
+presentation/
+catboost_info/
+docs/
