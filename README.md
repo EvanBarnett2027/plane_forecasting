@@ -186,7 +186,7 @@ validation slice.
 | Per-occasion MAE (48 h rate) | 0.072 |
 | Mean \|bias\| | 0.039 |
 | AUC-ROC | 0.694 |
-| Pearson r (pred vs actual rate) | — |
+| Pearson r (pred vs actual rate) | 0.685 |
 
 ---
 
