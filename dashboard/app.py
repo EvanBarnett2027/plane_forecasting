@@ -5,7 +5,7 @@ next 48 hours, with a refresh button, a search bar, and rich filtering.
 
 Run
 ---
-    # demo source (no API key needed -- replays a real window)
+    # demo source (`no API key needed -- replays a real window)
     .venv/bin/streamlit run dashboard/app.py
 
     # live source (real next-48h schedule + NWS forecasts)
@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import altair as alt
 
 # Make ``src.*`` importable when run via ``streamlit run dashboard/app.py``.
 ROOT = Path(__file__).resolve().parents[1]
@@ -82,16 +83,24 @@ st.session_state.setdefault("refresh_token", 0)
 with st.sidebar:
     st.header("Data source")
     env_key = resolve_api_key()   # aerodatabox.key file -> $AERODATABOX_KEY
+    # source = st.radio(
+    #     "Source",
+    #     options=["upcoming", "replay", "live"],
+    #     format_func=lambda s: {
+    #         "upcoming": "Next 48 h (live forecast)",
+    #         "replay": "Historical replay (with truth)",
+    #         "live": "Live (AeroDataBox + NWS)"}[s],
+    #     help="Next 48 h = ORD's recent schedule projected onto the real "
+    #          "upcoming dates + live NWS forecasts. Replay = a real labelled "
+    #          "window with ground truth. Live = real schedule via AeroDataBox "
+    #          "(needs an AeroDataBox key).")
+    
     source = st.radio(
         "Source",
-        options=["upcoming", "replay", "live"],
+        options=["live"],
         format_func=lambda s: {
-            "upcoming": "Next 48 h (live forecast)",
-            "replay": "Historical replay (with truth)",
             "live": "Live (AeroDataBox + NWS)"}[s],
-        help="Next 48 h = ORD's recent schedule projected onto the real "
-             "upcoming dates + live NWS forecasts. Replay = a real labelled "
-             "window with ground truth. Live = real schedule via AeroDataBox "
+        help="window with ground truth. Live = real schedule via AeroDataBox "
              "(needs an AeroDataBox key).")
 
     api_key = None
@@ -182,18 +191,46 @@ st.caption(f"As of **{as_of_ct:%Y-%m-%d %H:%M} CT**")
 # --------------------------------------------------------------------------- #
 
 left, right = st.columns([3, 2])
+
+risk_order = ["High", "Elevated", "Moderate", "Low"]
+
 with left:
     st.subheader("Predicted disruption rate by departure hour (CT)")
     by_hour = data["by_hour"].set_index("dep_hour")["predicted_rate"]
     st.line_chart(by_hour, height=260, y_label="P(disrupted)")
 with right:
     st.subheader("Risk mix")
-    # Counts per level, sorted descending.
-    mix = flights["risk"].value_counts().sort_values(ascending=False)
-    st.bar_chart(mix, height=260, color="#d62728", horizontal=True)
+
+    risk_order = ["High", "Elevated", "Moderate", "Low"]
+
+    mix = (
+        flights["risk"]
+        .value_counts()
+        .reindex(risk_order, fill_value=0)
+        .rename_axis("risk")
+        .reset_index(name="count")
+    )
+
+    chart = (
+        alt.Chart(mix)
+        .mark_bar(color="#d62728")
+        .encode(
+            x=alt.X("count:Q", title=None),
+            y=alt.Y("risk:N", sort=risk_order, title=None),
+            tooltip=[
+                alt.Tooltip("risk:N", title="Risk level"),
+                alt.Tooltip("count:Q", title="Count"),
+            ],
+        )
+        .properties(height=260)
+    )
+
+    st.altair_chart(chart, use_container_width=True)
+
     band_defs = "  ·  ".join(
         f"**{name}** {int(lo * 100)}–{int(min(hi, 1.0) * 100)}%"
-        for lo, hi, name in RISK_BANDS)
+        for lo, hi, name in RISK_BANDS
+    )
     st.caption("Levels by P(disrupted):  " + band_defs)
 
 # --------------------------------------------------------------------------- #
